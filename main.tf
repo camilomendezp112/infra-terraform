@@ -3,5 +3,5 @@ provider "aws" {
 }
 
 resource "aws_s3_bucket" "asset_management_infrastructure_project123456" {
-  bucket = "mi-bucket-prueba-123456"
+  bucket = "asset_management_infrastructure_project123456"
 }
