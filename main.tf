@@ -2,6 +2,17 @@ provider "aws" {
   region = "us-east-1"
 }
 
+terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+    }
+    archive = {
+      source = "hashicorp/archive"
+    }
+  }
+}
+
 resource "random_id" "bucket_id" {
   byte_length = 4
 }
@@ -30,6 +41,13 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = "index.js"
+  output_path = "dummy.zip"
+}
+
+
 resource "aws_lambda_function" "mi_lambda" {
   function_name = "mi-lambda"
 
@@ -38,6 +56,8 @@ resource "aws_lambda_function" "mi_lambda" {
   handler = "index.handler"
   runtime = "nodejs18.x"
 
-  filename = "dummy.zip"
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
 }
+
 
