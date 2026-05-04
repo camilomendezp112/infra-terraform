@@ -22,7 +22,7 @@ resource "aws_s3_bucket" "asset_management" {
 }
 
 resource "aws_iam_role" "lambda_role" {
-  name = "lambda-role"
+  name = "lambda-role-camilo-ajsh2343202"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
