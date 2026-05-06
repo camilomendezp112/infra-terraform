@@ -21,14 +21,7 @@ provider "aws" {
   region = var.aws_region
 }
 
-# --- 1. ARCHIVE FILES (LAMBDAS) ---
-# Automatically zip the lambda function code
-data "archive_file" "lambda_zips" {
-  for_each    = toset(["manageAsset", "getAssets", "syncUser"])
-  type        = "zip"
-  source_dir  = "lambda/${each.key}"
-  output_path = "lambda/${each.key}.zip"
-}
+
 
 # --- 2. AMAZON COGNITO (AUTHENTICATION) ---
 resource "aws_cognito_user_pool" "pool" {
@@ -231,8 +224,7 @@ resource "aws_lambda_function" "functions" {
   runtime       = "python3.11"
   timeout       = 10
 
-  filename         = data.archive_file.lambda_zips[each.key].output_path
-  source_code_hash = data.archive_file.lambda_zips[each.key].output_base64sha256
+  filename = "dummy.zip"
 
   environment {
     variables = {
