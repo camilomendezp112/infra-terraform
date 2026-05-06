@@ -224,6 +224,7 @@ resource "aws_lambda_function" "functions" {
   runtime       = "python3.11"
   timeout       = 10
 
+filename = "dummy.zip"
 
   environment {
     variables = {
