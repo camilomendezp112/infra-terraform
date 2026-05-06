@@ -21,9 +21,16 @@ provider "aws" {
   region = var.aws_region
 }
 
-# --- 1. AMAZON COGNITO (AUTHENTICATION) ---
-# Multi-tenant authentication strategy: 
-# Each user belongs to a tenant (tenant_id) and has a role (admin/user).
+# --- 1. ARCHIVE FILES (LAMBDAS) ---
+# Automatically zip the lambda function code
+data "archive_file" "lambda_zips" {
+  for_each    = toset(["manageAsset", "getAssets", "syncUser"])
+  type        = "zip"
+  source_dir  = "lambda/${each.key}"
+  output_path = "lambda/${each.key}.zip"
+}
+
+# --- 2. AMAZON COGNITO (AUTHENTICATION) ---
 resource "aws_cognito_user_pool" "pool" {
   name = "${var.project_name}-user-pool"
 
@@ -58,6 +65,10 @@ resource "aws_cognito_user_pool" "pool" {
     require_uppercase = true
   }
 
+  lambda_config {
+    post_confirmation = aws_lambda_function.functions["syncUser"].arn
+  }
+
   tags = {
     Project = var.project_name
   }
@@ -69,7 +80,7 @@ resource "aws_cognito_user_pool_client" "client" {
 
   # No client secret for frontend integration (React/S3)
   generate_secret = false
-  
+
   explicit_auth_flows = [
     "ALLOW_USER_PASSWORD_AUTH",
     "ALLOW_REFRESH_TOKEN_AUTH",
@@ -77,16 +88,7 @@ resource "aws_cognito_user_pool_client" "client" {
   ]
 }
 
-# --- 2. DYNAMODB (MULTI-TENANT DESIGN) ---
-# DESIGN CLAVE: Single-Table Design
-# PK = TENANT#<tenant_id> -> Grouping data by tenant ensures isolation and data locality.
-# SK = ASSET#<asset_id>   -> Unique identifier for each asset within the tenant.
-#
-# 🔥 PREVENCIÓN DE HOT PARTITIONS (SCALABILITY):
-# Para tenants masivos con millones de activos, se recomienda Sharding de la PK:
-# PK = TENANT#<tenant_id>#<shard_id> (donde shard_id es un hash o numero aleatorio 1-N).
-# Esto distribuye el tráfico a través de múltiples particiones físicas de DynamoDB.
-
+# --- 3. DYNAMODB (MULTI-TENANT DESIGN) ---
 resource "aws_dynamodb_table" "assets" {
   name         = "Assets"
   billing_mode = "PAY_PER_REQUEST" # Serverless scaling
@@ -113,12 +115,37 @@ resource "aws_dynamodb_table" "assets" {
     type = "S"
   }
 
+  attribute {
+    name = "user_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "type"
+    type = "S"
+  }
+
   # GSI1: Analítica y Reportes
-  # Permite buscar activos por estado ordenados por fecha de creación.
   global_secondary_index {
     name            = "GSI1"
     hash_key        = "status"
     range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  # GSI_User: Buscar activos por usuario dentro de un tenant
+  global_secondary_index {
+    name            = "GSI_User"
+    hash_key        = "PK"
+    range_key       = "user_id"
+    projection_type = "ALL"
+  }
+
+  # GSI_Type: Buscar activos por tipo dentro de un tenant
+  global_secondary_index {
+    name            = "GSI_Type"
+    hash_key        = "PK"
+    range_key       = "type"
     projection_type = "ALL"
   }
 
@@ -131,7 +158,7 @@ resource "aws_dynamodb_table" "assets" {
   }
 }
 
-# --- 3. IAM ROLES (SECURITY PRO) ---
+# --- 4. IAM ROLES (SECURITY PRO) ---
 resource "aws_iam_role" "lambda_exec" {
   name = "${var.project_name}-lambda-role"
 
@@ -164,10 +191,12 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "dynamodb:Query",
           "dynamodb:Scan"
         ]
-        Effect   = "Allow"
+        Effect = "Allow"
         Resource = [
           aws_dynamodb_table.assets.arn,
-          "${aws_dynamodb_table.assets.arn}/index/*"
+          "${aws_dynamodb_table.assets.arn}/index/GSI1",
+          "${aws_dynamodb_table.assets.arn}/index/GSI_User",
+          "${aws_dynamodb_table.assets.arn}/index/GSI_Type"
         ]
       },
       {
@@ -177,34 +206,33 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "logs:PutLogEvents"
         ]
         Effect   = "Allow"
-        Resource = "arn:aws:logs:*:*:*"
+        Resource = [
+          for lambda_name in ["manageAsset", "getAssets", "syncUser"] : 
+          "${aws_cloudwatch_log_group.logs[lambda_name].arn}:*"
+        ]
       }
     ]
   })
 }
 
-# --- 4. CLOUDWATCH LOGS ---
+# --- 5. CLOUDWATCH LOGS ---
 resource "aws_cloudwatch_log_group" "logs" {
-  for_each          = toset(["createAsset", "getAssets", "updateAsset", "deleteAsset"])
+  for_each          = toset(["manageAsset", "getAssets", "syncUser"])
   name              = "/aws/lambda/${var.project_name}-${each.key}"
   retention_in_days = 14
 }
 
-# --- 5. LAMBDA FUNCTIONS ---
-# ⚠️ Multi-tenancy Enforcement:
-# Las lambdas deben extraer 'tenant_id' del JWT Token (custom:tenant_id) 
-# y usarlo para construir la PK (TENANT#tenant_id).
-
+# --- 6. LAMBDA FUNCTIONS ---
 resource "aws_lambda_function" "functions" {
-  for_each      = toset(["createAsset", "getAssets", "updateAsset", "deleteAsset"])
+  for_each      = toset(["manageAsset", "getAssets", "syncUser"])
   function_name = "${var.project_name}-${each.key}"
   role          = aws_iam_role.lambda_exec.arn
   handler       = "app.lambda_handler"
   runtime       = "python3.11"
   timeout       = 10
 
-  filename         = "lambda/${each.key}.zip"
-  source_code_hash = filebase64sha256("lambda/${each.key}.zip")
+  filename         = data.archive_file.lambda_zips[each.key].output_path
+  source_code_hash = data.archive_file.lambda_zips[each.key].output_base64sha256
 
   environment {
     variables = {
@@ -215,78 +243,197 @@ resource "aws_lambda_function" "functions" {
   depends_on = [aws_cloudwatch_log_group.logs]
 }
 
-# --- 6. API GATEWAY (HTTP API V2) ---
-resource "aws_apigatewayv2_api" "api" {
-  name          = "${var.project_name}-api"
-  protocol_type = "HTTP"
-  
-  cors_configuration {
-    allow_origins = ["*"] # Ajustar para producción (e.g., URL de S3)
-    allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
-    allow_headers = ["content-type", "authorization"]
+# Allow Cognito to invoke syncUser lambda
+resource "aws_lambda_permission" "cognito" {
+  statement_id  = "AllowExecutionFromCognito"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.functions["syncUser"].function_name
+  principal     = "cognito-idp.amazonaws.com"
+  source_arn    = aws_cognito_user_pool.pool.arn
+}
+
+# --- 7. API GATEWAY (REST API V1) ---
+resource "aws_api_gateway_rest_api" "api" {
+  name        = "${var.project_name}-api"
+  description = "Hardened REST API for Asset Management"
+}
+
+# Authorizer
+resource "aws_api_gateway_authorizer" "cognito" {
+  name          = "cognito-authorizer"
+  type          = "COGNITO_USER_POOLS"
+  rest_api_id   = aws_api_gateway_rest_api.api.id
+  provider_arns = [aws_cognito_user_pool.pool.arn]
+}
+
+# Resource /assets
+resource "aws_api_gateway_resource" "assets" {
+  rest_api_id = aws_api_gateway_rest_api.api.id
+  parent_id   = aws_api_gateway_rest_api.api.root_resource_id
+  path_part   = "assets"
+}
+
+# Validation Model for POST/PUT /assets
+resource "aws_api_gateway_model" "asset_model" {
+  rest_api_id  = aws_api_gateway_rest_api.api.id
+  name         = "AssetModel"
+  description  = "Validates required fields and blocks malicious extra fields"
+  content_type = "application/json"
+
+  schema = jsonencode({
+    type                 = "object"
+    additionalProperties = false
+    required             = ["name", "type"]
+    properties = {
+      id      = { type = "string" }
+      name    = { type = "string", minLength = 1 }
+      type    = { type = "string", minLength = 1 }
+      modelo  = { type = "string" }
+      status  = { type = "string" }
+      user_id = { type = "string" }
+    }
+  })
+}
+
+resource "aws_api_gateway_request_validator" "validator" {
+  name                        = "StrictBodyValidator"
+  rest_api_id                 = aws_api_gateway_rest_api.api.id
+  validate_request_body       = true
+  validate_request_parameters = false
+}
+
+# --- Methods ---
+
+# GET /assets
+resource "aws_api_gateway_method" "get_assets" {
+  rest_api_id   = aws_api_gateway_rest_api.api.id
+  resource_id   = aws_api_gateway_resource.assets.id
+  http_method   = "GET"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+}
+
+resource "aws_api_gateway_integration" "get_assets_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.api.id
+  resource_id             = aws_api_gateway_resource.assets.id
+  http_method             = aws_api_gateway_method.get_assets.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.functions["getAssets"].invoke_arn
+}
+
+# POST /assets
+resource "aws_api_gateway_method" "post_assets" {
+  rest_api_id          = aws_api_gateway_rest_api.api.id
+  resource_id          = aws_api_gateway_resource.assets.id
+  http_method          = "POST"
+  authorization        = "COGNITO_USER_POOLS"
+  authorizer_id        = aws_api_gateway_authorizer.cognito.id
+  request_models       = { "application/json" = aws_api_gateway_model.asset_model.name }
+  request_validator_id = aws_api_gateway_request_validator.validator.id
+}
+
+resource "aws_api_gateway_integration" "post_assets_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.api.id
+  resource_id             = aws_api_gateway_resource.assets.id
+  http_method             = aws_api_gateway_method.post_assets.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.functions["manageAsset"].invoke_arn
+}
+
+# PUT /assets
+resource "aws_api_gateway_method" "put_assets" {
+  rest_api_id          = aws_api_gateway_rest_api.api.id
+  resource_id          = aws_api_gateway_resource.assets.id
+  http_method          = "PUT"
+  authorization        = "COGNITO_USER_POOLS"
+  authorizer_id        = aws_api_gateway_authorizer.cognito.id
+  request_models       = { "application/json" = aws_api_gateway_model.asset_model.name }
+  request_validator_id = aws_api_gateway_request_validator.validator.id
+}
+
+resource "aws_api_gateway_integration" "put_assets_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.api.id
+  resource_id             = aws_api_gateway_resource.assets.id
+  http_method             = aws_api_gateway_method.put_assets.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.functions["manageAsset"].invoke_arn
+}
+
+# DELETE /assets
+resource "aws_api_gateway_method" "delete_assets" {
+  rest_api_id   = aws_api_gateway_rest_api.api.id
+  resource_id   = aws_api_gateway_resource.assets.id
+  http_method   = "DELETE"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito.id
+}
+
+resource "aws_api_gateway_integration" "delete_assets_integration" {
+  rest_api_id             = aws_api_gateway_rest_api.api.id
+  resource_id             = aws_api_gateway_resource.assets.id
+  http_method             = aws_api_gateway_method.delete_assets.http_method
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.functions["manageAsset"].invoke_arn
+}
+
+# Deployment
+resource "aws_api_gateway_deployment" "deployment" {
+  depends_on = [
+    aws_api_gateway_integration.get_assets_integration,
+    aws_api_gateway_integration.post_assets_integration,
+    aws_api_gateway_integration.put_assets_integration,
+    aws_api_gateway_integration.delete_assets_integration
+  ]
+  rest_api_id = aws_api_gateway_rest_api.api.id
+
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
-resource "aws_apigatewayv2_stage" "default" {
-  api_id      = aws_apigatewayv2_api.api.id
-  name        = "$default"
-  auto_deploy = true
+# Stage with Throttling
+resource "aws_api_gateway_stage" "prod" {
+  deployment_id = aws_api_gateway_deployment.deployment.id
+  rest_api_id   = aws_api_gateway_rest_api.api.id
+  stage_name    = "prod"
 }
 
-# JWT Authorizer con Cognito
-resource "aws_apigatewayv2_authorizer" "cognito" {
-  api_id           = aws_apigatewayv2_api.api.id
-  authorizer_type  = "JWT"
-  identity_sources = ["$request.header.Authorization"]
-  name             = "cognito-authorizer"
+resource "aws_api_gateway_method_settings" "throttling" {
+  rest_api_id = aws_api_gateway_rest_api.api.id
+  stage_name  = aws_api_gateway_stage.prod.stage_name
+  method_path = "*/*"
 
-  jwt_configuration {
-    audience = [aws_cognito_user_pool_client.client.id]
-    issuer   = "https://${aws_cognito_user_pool.pool.endpoint}"
+  settings {
+    throttling_burst_limit = 10
+    throttling_rate_limit  = 5
   }
-}
-
-# Integrations
-resource "aws_apigatewayv2_integration" "integrations" {
-  for_each           = aws_lambda_function.functions
-  api_id             = aws_apigatewayv2_api.api.id
-  integration_type   = "AWS_PROXY"
-  integration_uri    = each.value.invoke_arn
-  integration_method = "POST"
-  payload_format_version = "2.0"
-}
-
-# Routes
-resource "aws_apigatewayv2_route" "routes" {
-  api_id    = aws_apigatewayv2_api.api.id
-  authorizer_id = aws_apigatewayv2_authorizer.cognito.id
-  authorization_type = "JWT"
-
-  for_each = {
-    "POST /assets"   = "createAsset"
-    "GET /assets"    = "getAssets"
-    "PUT /assets"    = "updateAsset"
-    "DELETE /assets" = "deleteAsset"
-  }
-
-  route_key = each.key
-  target    = "integrations/${aws_apigatewayv2_integration.integrations[each.value].id}"
 }
 
 # Lambda Permissions for API Gateway
-resource "aws_lambda_permission" "api_gw" {
-  for_each      = aws_lambda_function.functions
-  statement_id  = "AllowExecutionFromAPIGateway"
+resource "aws_lambda_permission" "api_gw_manage" {
+  statement_id  = "AllowExecutionFromAPIGatewayManage"
   action        = "lambda:InvokeFunction"
-  function_name = each.value.function_name
+  function_name = aws_lambda_function.functions["manageAsset"].function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.api.execution_arn}/*/*"
+  source_arn    = "${aws_api_gateway_rest_api.api.execution_arn}/*/*"
 }
 
-# --- 7. OUTPUTS ---
+resource "aws_lambda_permission" "api_gw_get" {
+  statement_id  = "AllowExecutionFromAPIGatewayGet"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.functions["getAssets"].function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.api.execution_arn}/*/*"
+}
+
+# --- 8. OUTPUTS ---
 output "api_url" {
   description = "URL del API Gateway para el frontend"
-  value       = aws_apigatewayv2_stage.default.invoke_url
+  value       = "${aws_api_gateway_stage.prod.invoke_url}/assets"
 }
 
 output "cognito_user_pool_id" {
