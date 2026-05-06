@@ -224,13 +224,19 @@ resource "aws_lambda_function" "functions" {
   runtime       = "python3.11"
   timeout       = 10
 
-  filename = "dummy.zip"
 
   environment {
     variables = {
       TABLE_NAME = aws_dynamodb_table.assets.name
     }
   }
+
+lifecycle {
+  ignore_changes = [
+    filename,
+    source_code_hash
+  ]
+}
 
   depends_on = [aws_cloudwatch_log_group.logs]
 }
