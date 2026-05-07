@@ -221,7 +221,7 @@ resource "aws_lambda_function" "functions" {
   function_name = "${var.project_name}-${each.key}"
   role          = aws_iam_role.lambda_exec.arn
   handler       = "index.lambda_handler"
-  runtime       = "python3.11"
+  runtime       = "nodejs18.x"
   timeout       = 10
 
 filename = "dummy.zip"
