@@ -220,7 +220,7 @@ resource "aws_lambda_function" "functions" {
   for_each      = toset(["manageAsset", "getAssets", "syncUser"])
   function_name = "${var.project_name}-${each.key}"
   role          = aws_iam_role.lambda_exec.arn
-  handler       = "app.lambda_handler"
+  handler       = "index.lambda_handler"
   runtime       = "python3.11"
   timeout       = 10
 
