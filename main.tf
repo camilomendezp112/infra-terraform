@@ -11,6 +11,11 @@ variable "aws_region" {
   default     = "us-east-1"
 }
 
+variable "sentry_dsn" {
+  description = "DSN de Sentry"
+  type        = string
+}
+
 variable "project_name" {
   description = "Name of the project for tagging and naming"
   type        = string
@@ -226,11 +231,12 @@ resource "aws_lambda_function" "functions" {
 
 filename = "dummy.zip"
 
-  environment {
-    variables = {
-      TABLE_NAME = aws_dynamodb_table.assets.name
-    }
+ environment {
+  variables = {
+    TABLE_NAME = aws_dynamodb_table.assets.name
+    SENTRY_DSN = var.sentry_dsn
   }
+}
 
 lifecycle {
   ignore_changes = [
